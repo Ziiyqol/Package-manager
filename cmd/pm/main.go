@@ -15,41 +15,53 @@ var (
 	rootCmd = &cobra.Command{
 		Use:   "pm",
 		Short: "Пакетный менеджер",
-		Long:  `Пакетный менеджер для архивации/распаковки и загрузки/скачивания файлов по SSH.`,
+		Long: `Пакетный менеджер для архивации/распаковки и загрузки/скачивания файлов по SSH.
+	Конфигурация загружается из переменных окружения (PM_SSH_USER и т.д).
+	Команды pm create и pm update`,
 	}
 
 	// Команда "pm create"
 	createCmd = &cobra.Command{
-		Use:   "create [path_to_config]",
+		Use:   "create [path_to_package]",
 		Short: "Упаковывает файлы и загружает на сервер",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg, err := config.LoadConfig()
 			if err != nil {
-				log.Fatalf("Error loading configuraton: %v", err)
+				log.Fatalf("Error loading configuration: %v", err)
 			}
 			sshClient := services.NewSSHClient(cfg)
+			defer func() {
+				if closeErr := sshClient.Close(); closeErr != nil {
+					log.Printf("error closing SSH client: %v", closeErr)
+				}
+			}()
 			pm := services.NewPackageManager(cfg, sshClient)
 			if err := pm.CreatePackage(args[0]); err != nil {
-				log.Fatalf("Error create to package: %v", err)
+				log.Fatalf("Error creating package: %v", err)
 			}
 		},
 	}
 
 	// Команда "pm update"
 	updateCmd = &cobra.Command{
-		Use:   "update [path_to_config]",
+		Use:   "update [path_to_package]",
 		Short: "Скачивает и распаковывает архивы",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg, err := config.LoadConfig()
 			if err != nil {
-				log.Fatalf("Error loading configuraton: %v", err)
+				log.Fatalf("Error loading configuration: %v", err)
 			}
 			sshClient := services.NewSSHClient(cfg)
+			defer func() {
+				if closeErr := sshClient.Close(); closeErr != nil {
+					log.Printf("error closing SSH client: %v", closeErr)
+				}
+			}()
 			pm := services.NewPackageManager(cfg, sshClient)
 			if err := pm.UpdatePackages(args[0]); err != nil {
-				log.Fatalf("Error create to package: %v", err)
+				log.Fatalf("Error updating packages: %v", err)
 			}
 		},
 	}

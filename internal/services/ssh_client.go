@@ -6,17 +6,20 @@ import (
 	"io"
 	"log"
 	"os"
-	"package-manager/internal/config"
 	"path/filepath"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"package-manager/internal/config"
 )
 
 // SSHClient инкапсулирует логику для работы с SSH-соединением.
 // Реализует интерфейс SSHClientInterface
 type SSHClient struct {
 	config *config.Config
+	client *ssh.Client
+	mu     sync.Mutex
 }
 
 // NewSSHClient создает новый экземпляр SSHClient
@@ -24,8 +27,23 @@ func NewSSHClient(cfg *config.Config) *SSHClient {
 	return &SSHClient{config: cfg}
 }
 
-// connect устанавливает SSH-соединение
+// connect устанавливает/возвращает SSH-соединение
 func (c *SSHClient) connect() (*ssh.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client != nil {
+		// Проверяем, живое ли соединение
+		_, err := c.client.NewSession()
+		if err == nil {
+			return c.client, nil // Живое - возвращаем
+		}
+		// Если нет, закрываем и переподключаемся
+		c.client.Close()
+		c.client = nil
+	}
+
+	// Чтение ключа
 	key, err := os.ReadFile(c.config.SSHKey)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось прочитать SSH-ключ: %w", err)
@@ -36,17 +54,21 @@ func (c *SSHClient) connect() (*ssh.Client, error) {
 		return nil, fmt.Errorf("не удалось разобрать SSH-ключ: %w", err)
 	}
 
-	knownHostsPath := filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")
+	// Получаем домашнюю директорию
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("не удалось определить домашнюю директорию: %w", err)
+	}
+	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
+
 	hostKeyCallback, err := knownhosts.New(knownHostsPath)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка при чтении файла known_hosts: %w", err)
 	}
 
 	sshConfig := &ssh.ClientConfig{
-		User: c.config.SSHUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
+		User:            c.config.SSHUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: hostKeyCallback,
 	}
 
@@ -55,7 +77,21 @@ func (c *SSHClient) connect() (*ssh.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ошибка SSH-соединения: %w", err)
 	}
+
+	c.client = client
 	return client, nil
+}
+
+// Close закрывает SSH-клиент (вызывать при shutdown сервиса)
+func (c *SSHClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client != nil {
+		err := c.client.Close()
+		c.client = nil
+		return err
+	}
+	return nil
 }
 
 // UploadFile загружает файл на удаленный сервер, используя SCP для более простой и быстрой реализации
@@ -64,7 +100,6 @@ func (c *SSHClient) UploadFile(fileName string, data *bytes.Buffer) error {
 	if err != nil {
 		return err
 	}
-	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
@@ -72,15 +107,13 @@ func (c *SSHClient) UploadFile(fileName string, data *bytes.Buffer) error {
 	}
 	defer session.Close()
 
-	// Получаем StdinPipe в основной горутине, чтобы избежать гонки
 	w, err := session.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("ошибка получения StdinPipe: %w", err)
 	}
 
-	// Запускаем фоновую горутину для отправки данных
 	go func() {
-		defer w.Close() // defer тут гарантирует закрытие пайпа после завершения
+		defer w.Close()
 		fmt.Fprintf(w, "C0644 %d %s\n", data.Len(), fileName)
 		io.Copy(w, data)
 		fmt.Fprint(w, "\x00")
@@ -90,7 +123,7 @@ func (c *SSHClient) UploadFile(fileName string, data *bytes.Buffer) error {
 	if err := session.Run(cmd); err != nil {
 		return fmt.Errorf("ошибка выполнения SCP: %w", err)
 	}
-	log.Println("info: Файл успешно загружен по SCP.")
+	log.Println("Файл успешно загружен по SCP.")
 	return nil
 }
 
@@ -100,7 +133,6 @@ func (c *SSHClient) DownloadFile(fileName string) (*bytes.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
@@ -113,7 +145,6 @@ func (c *SSHClient) DownloadFile(fileName string) (*bytes.Buffer, error) {
 		return nil, fmt.Errorf("ошибка получения stdout: %w", err)
 	}
 
-	// Запускаем удаленную команду `scp` в фоновом режиме
 	errChan := make(chan error, 1)
 	go func() {
 		defer close(errChan)
@@ -121,14 +152,12 @@ func (c *SSHClient) DownloadFile(fileName string) (*bytes.Buffer, error) {
 		errChan <- session.Run(cmd)
 	}()
 
-	// Читаем данные из пайпа в буфер
 	var buf bytes.Buffer
 	_, err = io.Copy(&buf, reader)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения данных: %w", err)
 	}
 
-	// Дожидаемся завершения удаленной команды
 	if err := <-errChan; err != nil {
 		return nil, fmt.Errorf("ошибка выполнения SCP: %w", err)
 	}
