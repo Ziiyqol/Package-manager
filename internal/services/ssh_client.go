@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,7 +15,7 @@ import (
 	"package-manager/internal/config"
 )
 
-// SSHClient инкапсулирует логику для работы с SSH-соединением.
+// SSHClient инкапсулирует логику для работы с SSH-соединением
 // Реализует интерфейс SSHClientInterface
 type SSHClient struct {
 	config *config.Config
@@ -61,9 +62,36 @@ func (c *SSHClient) connect() (*ssh.Client, error) {
 	}
 	knownHostsPath := filepath.Join(homeDir, ".ssh", "known_hosts")
 
-	hostKeyCallback, err := knownhosts.New(knownHostsPath)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка при чтении файла known_hosts: %w", err)
+	// Вспомогательная функция для добавления ключа хоста в known_hosts
+	addHostKeyToFile := func(path, addr string, key ssh.PublicKey) error {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		line := knownhosts.Line([]string{addr}, key)
+		_, err = fmt.Fprintln(file, line)
+		return err
+	}
+
+	// Новый колбэк, который проверяет ключ и добавляет его, если он неизвестен
+	hostKeyCallback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		knownHostsChecker, err := knownhosts.New(knownHostsPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Файл не существует, создаем его и добавляем ключ
+				return addHostKeyToFile(knownHostsPath, hostname, key)
+			}
+			return err
+		}
+
+		err = knownHostsChecker(hostname, remote, key)
+		if knownErr, ok := err.(*knownhosts.KeyError); ok && len(knownErr.Want) == 0 {
+			// Ключ неизвестен (это 1яя попытка), добавляем его
+			return addHostKeyToFile(knownHostsPath, hostname, key)
+		}
+		return err
 	}
 
 	sshConfig := &ssh.ClientConfig{
